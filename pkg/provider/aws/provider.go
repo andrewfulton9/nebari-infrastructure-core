@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -34,12 +35,26 @@ const (
 	attrKeyRegion = "region"
 )
 
-// Provider implements the AWS provider
-type Provider struct{}
+// Provider implements the AWS provider. Not safe to copy once constructed
+// (embeds a mutex). Always pass *Provider.
+type Provider struct {
+	kubeconfigMu    sync.RWMutex
+	kubeconfigCache map[kubeconfigCacheKey][]byte
+}
+
+// kubeconfigCacheKey identifies a cached kubeconfig within a single process.
+// (projectName, region) is sufficient since one Provider instance can be
+// reused across clusters in different regions or with different project names.
+type kubeconfigCacheKey struct {
+	projectName string
+	region      string
+}
 
 // NewProvider creates a new AWS provider
 func NewProvider() *Provider {
-	return &Provider{}
+	return &Provider{
+		kubeconfigCache: make(map[kubeconfigCacheKey][]byte),
+	}
 }
 
 // Name returns the provider name
@@ -69,6 +84,15 @@ func containsSubstring(slice []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+// invalidateKubeconfigCache removes any cached kubeconfig for the given
+// project/region. Called on Destroy so a follow-up Deploy in the same process
+// doesn't return stale data for a cluster that has been torn down and recreated.
+func (p *Provider) invalidateKubeconfigCache(projectName, region string) {
+	p.kubeconfigMu.Lock()
+	delete(p.kubeconfigCache, kubeconfigCacheKey{projectName: projectName, region: region})
+	p.kubeconfigMu.Unlock()
 }
 
 // extractAWSConfig converts the any provider config to AWS Config type
@@ -425,6 +449,14 @@ func (p *Provider) Destroy(ctx context.Context, projectName string, clusterConfi
 
 	region := awsCfg.Region
 
+	// Drop any cached kubeconfig for this cluster at the end on every
+	// exit path (success, error, panic), so callers reusing the same
+	// Provider after a destroy don't get a stale entry The call is
+	// idempotent: a missing entry is a no-op.
+	if !opts.DryRun {
+		defer p.invalidateKubeconfigCache(projectName, region)
+	}
+
 	// Get bucket name from config or generate one
 	bucketName := awsCfg.StateBucket
 	if bucketName == "" {
@@ -581,13 +613,16 @@ func (p *Provider) Destroy(ctx context.Context, projectName string, clusterConfi
 	return nil
 }
 
-// GetKubeconfig generates a kubeconfig file for the EKS cluster
+// GetKubeconfig generates a kubeconfig file for the EKS cluster.
+//
+// Results are cached in-memory per Provider instance, indexed by projectName and
+// region, so repeated calls within a single command invocation (e.g. ArgoCD, Longhorn,
+// and AWS LBC install) reuse the same fetched value.
 func (p *Provider) GetKubeconfig(ctx context.Context, projectName string, clusterConfig *config.ClusterConfig) ([]byte, error) {
 	tracer := otel.Tracer("nebari-infrastructure-core")
-	_, span := tracer.Start(ctx, "aws.GetKubeconfig")
+	ctx, span := tracer.Start(ctx, "aws.GetKubeconfig")
 	defer span.End()
 
-	// Extract AWS configuration
 	awsCfg, err := extractAWSConfig(ctx, clusterConfig)
 	if err != nil {
 		span.RecordError(err)
@@ -596,21 +631,7 @@ func (p *Provider) GetKubeconfig(ctx context.Context, projectName string, cluste
 
 	clusterName := projectName
 	region := awsCfg.Region
-
-	// Get bucket name from config or generate one
-	bucketName := awsCfg.StateBucket
-	if bucketName == "" {
-		stsClient, err := newSTSClient(ctx, region)
-		if err != nil {
-			span.RecordError(err)
-			return nil, fmt.Errorf("failed to create STS client: %w", err)
-		}
-		bucketName, err = getStateBucketName(ctx, stsClient, region, projectName)
-		if err != nil {
-			span.RecordError(err)
-			return nil, fmt.Errorf("failed to get state bucket name: %w", err)
-		}
-	}
+	cacheKey := kubeconfigCacheKey{projectName: projectName, region: region}
 
 	span.SetAttributes(
 		attribute.String("provider", ProviderName),
@@ -618,83 +639,36 @@ func (p *Provider) GetKubeconfig(ctx context.Context, projectName string, cluste
 		attribute.String(attrKeyRegion, region),
 	)
 
-	// Verify the state bucket exists before attempting to read outputs
-	s3Client, err := newS3Client(ctx, region)
+	// Concurrent callers with the same cacheKey can both miss here and both
+	// fetch from EKS. The mutex keeps the cache itself race-free, but we
+	// accept the duplicate DescribeCluster call rather than wrapping the miss
+	// path in singleflight. The cost of an extra API call is relatively low
+	// and parallel kubeconfig reads on the same cluster are rare enough to
+	// not justify the dependency.
+	p.kubeconfigMu.RLock()
+	if cached, ok := p.kubeconfigCache[cacheKey]; ok {
+		p.kubeconfigMu.RUnlock()
+		span.SetAttributes(attribute.Bool("cache_hit", true))
+		return cached, nil
+	}
+	p.kubeconfigMu.RUnlock()
+	span.SetAttributes(attribute.Bool("cache_hit", false))
+
+	eksClient, err := newEKSClient(ctx, region)
 	if err != nil {
 		span.RecordError(err)
-		return nil, fmt.Errorf("failed to create S3 client: %w", err)
+		return nil, fmt.Errorf("failed to create EKS client: %w", err)
 	}
-	bucketExists, err := stateBucketExists(ctx, s3Client, bucketName)
+
+	kubeconfigBytes, err := fetchEKSKubeconfig(ctx, eksClient, clusterName, region)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	if !bucketExists {
-		err := fmt.Errorf("state bucket does not exist: run 'deploy' first")
-		span.RecordError(err)
-		return nil, err
-	}
 
-	// Initialize terraform to read outputs from state
-	tf, err := tofu.Setup(ctx, tofuTemplates, awsCfg.toTFVars(projectName))
-	if err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to setup terraform: %w", err)
-	}
-	defer func() {
-		err := tf.Cleanup()
-		if err != nil {
-			span.RecordError(err)
-		}
-	}()
-
-	err = tf.Init(ctx,
-		tfexec.BackendConfig(fmt.Sprintf("bucket=%s", bucketName)),
-		tfexec.BackendConfig(fmt.Sprintf("key=%s", stateKey(projectName))),
-		tfexec.BackendConfig(fmt.Sprintf("region=%s", region)),
-	)
-	if err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to initialize terraform: %w", err)
-	}
-
-	// Get outputs from terraform state
-	outputs, err := tf.Output(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to get terraform outputs: %w", err)
-	}
-
-	endpoint, ok := outputs["cluster_endpoint"]
-	if !ok {
-		err := fmt.Errorf("cluster not found: run 'deploy' first to create the cluster")
-		span.RecordError(err)
-		return nil, err
-	}
-
-	caData, ok := outputs["cluster_certificate_authority_data"]
-	if !ok {
-		err := fmt.Errorf("cluster not found: run 'deploy' first to create the cluster")
-		span.RecordError(err)
-		return nil, err
-	}
-
-	// Output values are JSON-encoded strings, need to extract the actual string value
-	var endpointStr, caDataStr string
-	if err := json.Unmarshal(endpoint.Value, &endpointStr); err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to unmarshal cluster_endpoint: %w", err)
-	}
-	if err := json.Unmarshal(caData.Value, &caDataStr); err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to unmarshal cluster_certificate_authority_data: %w", err)
-	}
-
-	kubeconfigBytes, err := buildKubeconfig(clusterName, endpointStr, caDataStr, region)
-	if err != nil {
-		span.RecordError(err)
-		return nil, fmt.Errorf("failed to build kubeconfig: %w", err)
-	}
+	p.kubeconfigMu.Lock()
+	p.kubeconfigCache[cacheKey] = kubeconfigBytes
+	p.kubeconfigMu.Unlock()
 
 	return kubeconfigBytes, nil
 }

@@ -42,6 +42,7 @@ type TFVars struct {
 	EFSEncrypted                  bool                 `json:"efs_encrypted"`
 	EFSKMSKeyArn                  *string              `json:"efs_kms_key_arn,omitempty"`
 	NodeSGAdditionalRules         map[string]any       `json:"node_security_group_additional_rules,omitempty"`
+	ExtraCABundle                 *string              `json:"extra_ca_bundle,omitempty"`
 }
 
 func resolveNodeGroupAMIs(nodeGroups map[string]NodeGroup) map[string]NodeGroup {
@@ -62,7 +63,7 @@ func resolveNodeGroupAMIs(nodeGroups map[string]NodeGroup) map[string]NodeGroup 
 	return result
 }
 
-func (c *Config) toTFVars(projectName string) TFVars {
+func (c *Config) toTFVars(projectName string) (TFVars, error) {
 	vars := TFVars{
 		Region:                 c.Region,
 		ProjectName:            projectName,
@@ -126,6 +127,14 @@ func (c *Config) toTFVars(projectName string) TFVars {
 		}
 	}
 
+	caBundle, err := c.TrustBundle.ResolveBase64()
+	if err != nil {
+		return TFVars{}, err
+	}
+	if caBundle != "" {
+		vars.ExtraCABundle = &caBundle
+	}
+
 	if c.EFS != nil {
 		vars.EFSEnabled = c.EFS.Enabled
 		vars.EFSPerformanceMode = c.EFS.PerformanceMode
@@ -139,5 +148,5 @@ func (c *Config) toTFVars(projectName string) TFVars {
 		}
 	}
 
-	return vars
+	return vars, nil
 }

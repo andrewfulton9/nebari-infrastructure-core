@@ -1,6 +1,6 @@
 module "eks_cluster" {
   source  = "nebari-dev/eks-cluster/aws"
-  version = "0.4.0"
+  version = "0.5.0"
 
   project_name                             = var.project_name
   tags                                     = var.tags
@@ -29,4 +29,5 @@ module "eks_cluster" {
   efs_encrypted                            = var.efs_encrypted
   efs_kms_key_arn                          = var.efs_kms_key_arn
   node_security_group_additional_rules     = var.node_security_group_additional_rules
+  extra_ca_bundle                          = var.extra_ca_bundle
 }

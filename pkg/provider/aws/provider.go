@@ -357,7 +357,14 @@ func (p *Provider) Deploy(ctx context.Context, projectName string, clusterConfig
 			return fmt.Errorf("failed to get kubeconfig for Longhorn install: %w", err)
 		}
 
-		if err := longhorn.Install(ctx, kubeconfigBytes, awsCfg.Longhorn); err != nil {
+		// Tell Longhorn whether the Cluster Autoscaler is present so it can mark
+		// instance-manager pods safe-to-evict on empty nodes - otherwise those
+		// pods pin otherwise-idle nodes and block scale-down. WithCluster-
+		// AutoscalerEnabled returns a copy, so the caller-owned awsCfg.Longhorn
+		// is never mutated.
+		longhornCfg := awsCfg.Longhorn.WithClusterAutoscalerEnabled(awsCfg.ClusterAutoscalerEnabled())
+
+		if err := longhorn.Install(ctx, kubeconfigBytes, longhornCfg); err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to install Longhorn: %w", err)
 		}
@@ -394,6 +401,22 @@ func (p *Provider) Deploy(ctx context.Context, projectName string, clusterConfig
 		if err := installAWSLoadBalancerController(ctx, kubeconfigBytes, awsCfg, projectName, vpcID); err != nil {
 			span.RecordError(err)
 			return fmt.Errorf("failed to install AWS Load Balancer Controller: %w", err)
+		}
+	}
+
+	// Install Cluster Autoscaler if enabled. IAM is provided by the EKS Pod
+	// Identity association created by the terraform-aws-eks-cluster module
+	// (enable_cluster_autoscaler_pod_identity, default true).
+	if awsCfg.ClusterAutoscalerEnabled() {
+		kubeconfigBytes, err := p.GetKubeconfig(ctx, projectName, clusterConfig)
+		if err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to get kubeconfig for Cluster Autoscaler install: %w", err)
+		}
+
+		if err := installClusterAutoscaler(ctx, kubeconfigBytes, awsCfg, projectName); err != nil {
+			span.RecordError(err)
+			return fmt.Errorf("failed to install Cluster Autoscaler: %w", err)
 		}
 	}
 

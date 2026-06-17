@@ -88,7 +88,13 @@ spec:
                       - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
                         action: replace
                         regex: ([^:]+)(?::\d+)?;(\d+)
-                        replacement: $1:$2
+                        # $$ escapes the $ for the OTel collector's confmap
+                        # resolver (which expands ${...}); it resolves to a
+                        # literal $1/$2 Prometheus regex backreference. Bare
+                        # $1:$2 is the deprecated form and triggers env-style
+                        # expansion warnings. Matches the $${1} used by the
+                        # cAdvisor/kubelet jobs below.
+                        replacement: $$1:$$2
                         target_label: __address__
 
                   # cAdvisor — per-container CPU/memory/network metrics
@@ -235,6 +241,16 @@ spec:
     namespace: monitoring
 
   syncPolicy:
+    # Opt the monitoring namespace into Nebari management at creation time.
+    # The collector app (sync-wave 4) is the first thing to create this
+    # namespace, so any later software pack that drops a NebariApp here
+    # (e.g. nebari-lgtm-pack exposing Grafana via the gateway) is reconciled
+    # by the nebari-operator instead of rejected with NamespaceNotOptedIn.
+    # managedNamespaceMetadata only applies the label to a namespace this app
+    # creates, hence it must live on the namespace's creator, not the pack.
+    managedNamespaceMetadata:
+      labels:
+        nebari.dev/managed: "true"
     automated:
       prune: true
       selfHeal: true

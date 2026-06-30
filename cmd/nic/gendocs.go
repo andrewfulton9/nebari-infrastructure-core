@@ -35,6 +35,7 @@ func runGendocs(cmd *cobra.Command, args []string) error {
 
 	// Remove this command from rootCmd so it is excluded from the generated output.
 	rootCmd.RemoveCommand(cmd)
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
 
 	if err := doc.GenMarkdownTree(rootCmd, gendocsOutputDir); err != nil {
 		return err
